@@ -1,85 +1,110 @@
-machine:
-  java:
-    # latest wiremock version needs java 8
-    version: oraclejdk8
-  environment:
-    # auth for the coveralls report
-    COVERALLS_REPO_TOKEN: mHJjy4h8zt9RIIBKg8sBosF5JkKsFk139
+version: 2
+jobs:
+  build:
+    docker:
+      - image: ubuntu:14.04
 
-    # chooce network device for tests with wiremock support and emulator
-    TEST_MOCK_IFACE: eth0
+      - image: mongo:2.6.8
+        command: [mongod, --smallfiles]
 
-test:
-  pre:
-  # emulator startup need some minutes that's why start it before first build/test steps for build speed up
-    - emulator -avd circleci-android22 -no-audio -no-window:
-        background: true
-        parallel: true
+      - image: postgres:9.4.1
+        # some containers require setting environment variables
+        environment:
+          POSTGRES_USER: root
 
-  override:
-    # Build the code
-    - ./gradlew app:assembleDebug
+      - image: redis@sha256:54057dd7e125ca41afe526a877e8bd35ec2cdd33b9217e022ed37bdcf7d09673
 
-    # Execute Unit Tests
-    - ./gradlew app:test
+      - image: rabbitmq:3.5.4
 
-    # start wiremock to support tests with network communication
-    - tools/src/main/resources/start-wiremock.sh:
-          # start at background to use wiremock in next build steps
-          background: true
+    environment:
+      TEST_REPORTS: /tmp/test-reports
 
-    # Execute Component Tests
-    - ./gradlew appCt:test
+    working_directory: ~/my-project
 
-    # Check lint hints
-    - ./gradlew app:lint
+    branches:
+      ignore:
+        - develop
+        - /feature-.*/
 
-    # Build instrumented test code
-    # fix apk not build https://code.google.com/p/android/issues/detail?id=180689
-    - ./gradlew appIt:assembleDebug
+    steps:
+      - checkout
 
-    # ensure that the emulator is ready to use
-    - circle-android wait-for-boot
-    # the necessary sleep duration may change with time and depends on the pre tasks length.
-    # When all pre tasks are run long enough then waiting will not be necessary anymore.
-    # This sleep should avoid the com.android.builder.testing.api.DeviceException: com.android.ddmlib.ShellCommandUnresponsiveException
-    - sleep 60
-    # at least remove the look screen
-    - adb shell input keyevent 82
+      - run:
+          command: echo 127.0.0.1 devhost | sudo tee -a /etc/hosts
 
-    # later we collect the logs from test run
-    - adb logcat -d
+      # Create Postgres users and database
+      # Note the YAML heredoc '|' for nicer formatting
+      - run: |
+          sudo -u root createuser -h localhost --superuser ubuntu &&
+          sudo createdb -h localhost test_db
 
-    # execute tests on emulator
-    - ./gradlew appIt:connectedCheck
+      - restore_cache:
+          keys:
+            - v1-my-project-{{ checksum "project.clj" }}
+            - v1-my-project-
 
-    # Create coverage report
-    - ./gradlew jacocoTestReport
+      - run:
+          environment:
+            SSH_TARGET: "localhost"
+            TEST_ENV: "linux"
+          command: |
+            set -xu
+            mkdir -p ${TEST_REPORTS}
+            run-tests.sh
+            cp out/tests/*.xml ${TEST_REPORTS}
 
-    # copy test results
-    - mv app/build/reports/tests/debug $CIRCLE_TEST_REPORTS/AppUnitTests
-    - mv appCt/build/test-report $CIRCLE_TEST_REPORTS/ComponentTests
-    - mv appIt/build/reports/androidTests/connected $CIRCLE_TEST_REPORTS/AndroidTests
-    - mv build/reports/jacoco/test/html $CIRCLE_TEST_REPORTS/CodeCoverageReport
+      - run: |
+          set -xu
+          mkdir -p /tmp/artifacts
+          create_jars.sh ${CIRCLE_BUILD_NUM}
+          cp *.jar /tmp/artifacts
 
-    # copy lint report
-    - mkdir $CIRCLE_TEST_REPORTS/Lint
-    - mv app/build/outputs/lint-results_files $CIRCLE_TEST_REPORTS/Lint
-    - mv app/build/outputs/lint-results.html $CIRCLE_TEST_REPORTS/Lint/lint-app-results.html
+      - save_cache:
+          key: v1-my-project-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
 
-    # circleCi proper test value feature
-    - mkdir $CIRCLE_TEST_REPORTS/junit
-    - find */build/test-results -name "*.xml" -exec cp {} $CIRCLE_TEST_REPORTS/junit/ \;
-    - find */build/outputs/androidTest-results/ -name "*.xml" -exec cp {} $CIRCLE_TEST_REPORTS/junit/ \;
+      # Save artifacts
+      - store_artifacts:
+          path: /tmp/artifacts
+          destination: build
 
-    # collect logs from emulator
-    - adb logcat -d > $CIRCLE_ARTIFACTS/logcat_emulator.txt
+      # Upload test results
+      - store_test_results:
+          path: /tmp/test-reports
+          
+  deploy-stage:
+    docker:
+      - image: ubuntu:14.04
+    working_directory: /tmp/my-project  
+    steps:
+      - run:
+          name: Deploy if tests pass and branch is Staging
+          command: ansible-playbook site.yml -i staging          
+          
+  deploy-prod:
+    docker:
+      - image: ubuntu:14.04
+    working_directory: /tmp/my-project  
+    steps:
+      - run:
+          name: Deploy if tests pass and branch is Master
+          command: ansible-playbook site.yml -i production
 
-# Only executed if all tasks are successful
-deployment:
-
-  # report coverage to coveralls
-  coverage:
-    branch: [master, rewrite]
-    commands:
-    - ./gradlew coveralls
+workflows:
+  version: 2
+  build-deploy:
+    jobs:
+      - build
+      - deploy-stage:
+          requires:
+            - build
+          filters:
+            branches:
+              only: staging
+      - deploy-prod:
+          requires:
+            - build
+          filters:
+            branches:
+              only: master  
